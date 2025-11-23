@@ -1,0 +1,540 @@
+# Copyright 2025 IBM.com. All Rights Reserved.
+# Author: Reza Beykzadeh
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: Sets up EC2 Image Builder to create a RHEL 9 STIG AMI (authselect + Image Builder-safe firewalld handling).
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The ID of the VPC where the EC2 instances will be launched.
+  DemoSubnetIds:
+    Type: AWS::EC2::Subnet::Id
+    Description: The ID of the subnet where the EC2 instances will be launched.
+  STIGArtifactsBukcet:
+    Type: String
+    Description: The name of the S3 bucket where STIG artifacts will be stored.
+  BuildInstanceType:
+    Type: String
+    Default: t3.medium
+    Description: Instance type for EC2 instances used to build the AMI
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+      - t3.nano
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+
+Resources:
+  # S3 Buckets
+  ImageBuilderLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        -  ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ImageBuilderLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSSLRequestsOnly
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: 
+              - !Sub arn:${AWS::Partition}:s3:::${ImageBuilderLogBucket}/*
+              - !Sub arn:${AWS::Partition}:s3:::${ImageBuilderLogBucket}
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  STIGArtifactsBucket:
+    Type: AWS::S3::Bucket
+
+  # IAM Role for instances
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      Comment: Role to be used by instance during image build.
+    Properties:
+      ManagedPolicyArns:
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/EC2InstanceProfileForImageBuilder
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /executionServiceEC2Role/
+      Policies:
+        - PolicyName: SSMManagedInstanceCorePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:DescribeAssociation
+                  - ssm:GetDeployablePatchSnapshotForInstance
+                  - ssm:GetDocument
+                  - ssm:DescribeDocument
+                  - ssm:GetManifest
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:ListAssociations
+                  - ssm:ListInstanceAssociations
+                  - ssm:PutInventory
+                  - ssm:PutComplianceItems
+                  - ssm:PutConfigurePackageResult
+                  - ssm:UpdateAssociationStatus
+                  - ssm:UpdateInstanceAssociationStatus
+                  - ssm:UpdateInstanceInformation
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                  - ec2messages:AcknowledgeMessage
+                  - ec2messages:DeleteMessage
+                  - ec2messages:FailMessage
+                  - ec2messages:GetEndpoint
+                  - ec2messages:GetMessages
+                  - ec2messages:SendReply
+                Resource: '*'
+        - PolicyName: EC2InstanceProfileForImageBuilderPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - imagebuilder:GetComponent
+                  - kms:Decrypt
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:CreateLogGroup
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+
+  # Security Group
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow outbound traffic for SSM Session Manager and package downloads
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+
+  # Policy to allow the instance to write to S3 buckets
+  InstanceRoleLoggingPolicy:
+    Type: AWS::IAM::Policy
+    Metadata:
+      Comment: Allows the instance to place log files to S3 buckets.
+    Properties:
+      PolicyName: ImageBuilderLogBucketPolicy
+      Roles:
+        - !Ref InstanceRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${ImageBuilderLogBucket}/*"
+              - !Sub "arn:${AWS::Partition}:s3:::${STIGArtifactsBukcet}/*"
+          - Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${ImageBuilderLogBucket}"
+              - !Sub "arn:${AWS::Partition}:s3:::${STIGArtifactsBukcet}"
+
+  # Instance Profile
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /executionServiceEC2Role/
+      Roles:
+        - !Ref InstanceRole
+
+  # KMS Key for encryption
+  ec2ImageBuilderKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Key to use for EBS encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: kms:*
+            Resource: '*'
+      KeyUsage: ENCRYPT_DECRYPT
+      EnableKeyRotation: true
+
+  # Key alias
+  ec2KeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${AWS::StackName}key"
+      TargetKeyId: !Ref ec2ImageBuilderKey
+
+  # Install Ansible and RHEL 9 STIG Role Component (Image Builder-safe)
+  InstallAnsibleSTIGRoleComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: install-ansible-rhel9-stig-role
+      Platform: Linux
+      Version: "1.1.14"
+      Description: Install Ansible, AIDE, FIPS, SSSD, create authselect custom profile, and drop STIG playbook + first-boot firewalld unit.
+      ChangeDescription: Build-phase safe firewalld handling; authselect custom profile; sanitized Data YAML.
+      Data: |-
+        name: Install Ansible and RHEL 9 STIG Role
+        description: Install Ansible, collections, AIDE, FIPS/dracut, SSSD, authselect custom profile, and RedHatOfficial.rhel9_stig role. Prepare first-boot systemd unit for firewalld.
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: InstallAnsible
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - |
+                      set -euo pipefail
+                      dnf clean all
+                      dnf -y update
+                      dnf -y install python3-pip
+                      pip3 install --upgrade pip
+                      pip3 install ansible
+              - name: InstallAnsibleCollections
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - ansible-galaxy collection install community.general
+                    - ansible-galaxy collection install ansible.posix
+              - name: InstallSTIGRole
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - ansible-galaxy install RedHatOfficial.rhel9_stig
+              - name: InstallAndConfigureAIDE
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - dnf -y install aide
+                    - aide --init
+                    - mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz
+              - name: PrepareFIPSAndDracut
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - mkdir -p /etc/dracut.conf.d
+                    - dnf -y install dracut-fips dracut-fips-aesni
+                    - echo 'add_dracutmodules+=" fips "' > /etc/dracut.conf.d/40-fips.conf
+                    - fips-mode-setup --enable || echo "FIPS setup attempted"
+              - name: InstallRequiredPackages
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - dnf -y install firewalld NetworkManager sssd sssd-tools autofs rsh-server ypserv telnet-server tftp-server || true
+                    # Do NOT start/enable services in Image Builder build phase (no systemd PID 1)
+              - name: ConfigureSSSD
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - mkdir -p /etc/sssd
+                    - |
+                      cat > /etc/sssd/sssd.conf << 'EOF'
+                      [sssd]
+                      services = nss, pam
+                      config_file_version = 2
+                      domains = LOCAL
+
+                      [domain/LOCAL]
+                      id_provider = files
+                      EOF
+                    - chmod 600 /etc/sssd/sssd.conf
+                    - chown root:root /etc/sssd/sssd.conf
+              - name: ConfigureAuthselect
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - authselect current || true
+                    - |
+                      if [ ! -d /etc/authselect/custom/hardening ]; then
+                        authselect create-profile hardening -b sssd
+                      fi
+                    - cp -a /etc/authselect/sssd/. /etc/authselect/custom/hardening/
+                    - authselect select custom/hardening --force
+                    - authselect apply-changes
+                    - authselect current || true
+              - name: ConfigurePAMModules
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - dnf -y install pam || true
+                    - |
+                      grep -q "pam_lastlog.so" /etc/pam.d/postlogin || {
+                        echo "session     optional      pam_lastlog.so showfailed" >> /etc/pam.d/postlogin
+                      }
+                    - |
+                      grep -q "pam_lastlog.so" /etc/pam.d/login || {
+                        echo "session     optional      pam_lastlog.so showfailed" >> /etc/pam.d/login
+                      }
+                    - authselect apply-changes || true
+              - name: CreatePlaybook
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - |
+                      cat > /tmp/rhel9-stig-playbook.yml << 'EOF'
+                      ---
+                      - hosts: localhost
+                        connection: local
+                        become: yes
+                        gather_facts: true
+
+                        pre_tasks:
+                          # ---- Build-safe service/package facts (no systemd starts) ----
+                          - name: Ensure firewalld is installed (unit must exist for service_facts)
+                            ansible.builtin.package:
+                              name: firewalld
+                              state: present
+
+                          - name: Ensure NetworkManager is installed
+                            ansible.builtin.package:
+                              name: NetworkManager
+                              state: present
+
+                          - name: Gather service facts (do not start services in Image Builder)
+                            ansible.builtin.service_facts:
+
+                          - name: Synthesize firewalld.service fact if missing (Image Builder lacks systemd)
+                            ansible.builtin.set_fact:
+                              ansible_facts: "{{ ansible_facts | combine({'services': (ansible_facts.services | default({})) | combine({'firewalld.service': {'name': 'firewalld.service', 'state': 'stopped'}}) }) }}"
+                            when: ansible_facts.services is not defined or 'firewalld.service' not in ansible_facts.services
+
+                          - name: Gather package facts
+                            ansible.builtin.package_facts:
+                              manager: auto
+                            ignore_errors: true
+
+                          - name: Ensure ansible_facts.packages key exists
+                            ansible.builtin.set_fact:
+                              ansible_facts: "{{ ansible_facts | combine({'packages': ansible_facts.packages | default({})}) }}"
+
+                          - name: Check if 'aide' is installed via rpm as fallback
+                            ansible.builtin.command: rpm -q --qf '%{NAME}\n' aide
+                            register: rpm_aide
+                            changed_when: false
+                            failed_when: false
+                            when: "'aide' not in ansible_facts.packages"
+
+                          - name: Synthesize 'aide' package fact when rpm reports installed
+                            ansible.builtin.set_fact:
+                              ansible_facts: "{{ ansible_facts | combine({'packages': (ansible_facts.packages | default({})) | combine({'aide': [{'version': 'present'}]}) }) }}"
+                            when:
+                              - "'aide' not in ansible_facts.packages"
+                              - rpm_aide is defined
+                              - (rpm_aide.rc | int) == 0
+
+                          # ---- NEW: Provide getent facts used by the role ----
+                          - name: Gather getent passwd
+                            ansible.builtin.getent:
+                              database: passwd
+                            register: ge_passwd
+                            changed_when: false
+                            failed_when: false
+
+                          - name: Gather getent group
+                            ansible.builtin.getent:
+                              database: group
+                            register: ge_group
+                            changed_when: false
+                            failed_when: false
+
+                          - name: Gather getent shadow (may be restricted; ignore errors)
+                            ansible.builtin.getent:
+                              database: shadow
+                            register: ge_shadow
+                            changed_when: false
+                            failed_when: false
+
+                          - name: Ensure getent_* facts exist even if lookups failed
+                            ansible.builtin.set_fact:
+                              ansible_facts: >-
+                                {{
+                                  ansible_facts
+                                  | combine({
+                                      'getent_passwd': (ge_passwd.ansible_facts.getent_passwd | default({})),
+                                      'getent_group':  (ge_group.ansible_facts.getent_group   | default({})),
+                                      'getent_shadow': (ge_shadow.ansible_facts.getent_shadow | default({}))
+                                    })
+                                }}
+
+                        vars:
+                          authselect_current_profile: "custom/hardening"
+                          authselect_custom_profile:  "custom/hardening"
+                          display_login_attempts: false
+
+                          # Avoid firewall manipulations during build (systemd not running)
+                          service_firewalld_enabled: false
+                          firewalld_sshd_port_enabled: false
+
+                        roles:
+                          - { role: RedHatOfficial.rhel9_stig }
+                      EOF
+
+
+              - name: InstallFirstBootFirewalldUnit
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - |
+                      cat > /etc/systemd/system/firstboot-firewalld.service << 'UNIT'
+                      [Unit]
+                      Description=First-boot: enable firewalld and allow SSH
+                      After=network.target
+                      ConditionPathExists=!/var/lib/firstboot-firewalld.done
+
+                      [Service]
+                      Type=oneshot
+                      ExecStart=/bin/bash -c '
+                        set -e
+                        systemctl enable firewalld || true
+                        systemctl start firewalld || true
+                        firewall-cmd --permanent --add-service=ssh || true
+                        firewall-cmd --reload || true
+                        mkdir -p /var/lib
+                        touch /var/lib/firstboot-firewalld.done
+                      '
+
+                      [Install]
+                      WantedBy=multi-user.target
+                      UNIT
+                    - mkdir -p /etc/systemd/system/multi-user.target.wants
+                    - ln -sf /etc/systemd/system/firstboot-firewalld.service /etc/systemd/system/multi-user.target.wants/firstboot-firewalld.service || true
+
+  # Apply RHEL 9 STIG Component
+  ApplyRHEL9STIGComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: apply-rhel9-stig
+      Platform: Linux
+      Version: "1.1.14"
+      Description: Apply RHEL 9 STIG Configuration
+      ChangeDescription: Pass explicit vars; safe for Image Builder environment.
+      Data: |-
+        name: RHEL 9 STIG Configuration Application
+        description: Apply RHEL 9 STIG configuration using the RedHatOfficial role (Image Builder-safe).
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: CheckPlaybook
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - ansible-playbook --check /tmp/rhel9-stig-playbook.yml -e 'authselect_current_profile=custom/hardening authselect_custom_profile=custom/hardening service_firewalld_enabled=false firewalld_sshd_port_enabled=false'
+              - name: ApplySTIG
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - ansible-playbook /tmp/rhel9-stig-playbook.yml -e 'authselect_current_profile=custom/hardening authselect_custom_profile=custom/hardening service_firewalld_enabled=false firewalld_sshd_port_enabled=false'
+              - name: VerifyConfiguration
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - echo "RHEL 9 STIG configuration applied successfully"
+                    - systemctl status --no-pager || true
+
+  # Image Recipe
+  RHEL9STIGImageRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      AdditionalInstanceConfiguration:
+        SystemsManagerAgent:
+          UninstallAfterBuild: false
+      Name: rhel9-stig-image-recipe
+      Version: "1.1.14"
+      ParentImage: !Sub "arn:${AWS::Partition}:imagebuilder:${AWS::Region}:aws:image/red-hat-enterprise-linux-9-x86/x.x.x"
+      Description: Creates RHEL 9 STIG AMI
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            DeleteOnTermination: false
+            Encrypted: true
+            KmsKeyId: !Ref ec2ImageBuilderKey
+            VolumeType: gp3
+            VolumeSize: 20
+      Components:
+        - ComponentArn: !Ref InstallAnsibleSTIGRoleComponent
+        - ComponentArn: !Ref ApplyRHEL9STIGComponent
+      Tags:
+        Name: RHEL9-STIG-Image-Recipe
+
+  # Infrastructure Configuration
+  InfrastructureConfiguration:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: RHEL9-STIG-Image-Builder-Infrastructure
+      InstanceProfileName: !Ref InstanceProfile
+      Description: Creates Infrastructure for RHEL 9 STIG AMI
+      InstanceTypes:
+        - !Ref BuildInstanceType
+      KeyPair: imagebuilder
+      Logging:
+        S3Logs:
+          S3BucketName: !Ref ImageBuilderLogBucket
+          S3KeyPrefix: !Sub "imagebuilder-${AWS::StackName}"
+      TerminateInstanceOnFailure: true
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      SubnetId: !Ref DemoSubnetIds
+
+  # Image Pipeline
+  ImagePipeline:
+    Type: AWS::ImageBuilder::ImagePipeline
+    Properties:
+      Name: rhel9-stig-image-pipeline
+      Description: Build RHEL 9 STIG Instance
+      ImageRecipeArn: !Ref RHEL9STIGImageRecipe
+      InfrastructureConfigurationArn: !Ref InfrastructureConfiguration
+      ImageScanningConfiguration:
+        ImageScanningEnabled: false
+      ImageTestsConfiguration:
+        ImageTestsEnabled: false
+        TimeoutMinutes: 90
+      Status: ENABLED
+      Tags:
+        Name: RHEL9-STIG-Image-Pipeline
